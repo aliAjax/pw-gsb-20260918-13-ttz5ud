@@ -13,6 +13,7 @@ PORT=3019 node server.js
 - `GET /health`
 - `GET /tunes`
 - `POST /tunes`
+- `POST /tunes/:id/copy`
 - `GET /tunes/:id/progress`
 - `GET /tunes/:id/sections`
 - `POST /tunes/:id/sections`
@@ -21,6 +22,15 @@ PORT=3019 node server.js
 - `GET /issues?tuneId=&status=`
 - `POST /issues`
 - `PATCH /issues/:id/status`
+
+## 复制曲目
+
+`POST /tunes/:id/copy`，请求体 `{"title":"新标题"}`：
+
+- 仅当原曲目全部区间已校对且没有未解决问题时才可复制，任一条件不满足则整次拒绝（409）且不落盘
+- 新标题必须未被占用，否则返回 409
+- 区间与已解决问题一并复制并分配新编号，复制出的区间全部回到未校对，未解决问题不复制
+- 原曲目数据保持不变，并发复制串行执行，不会重复或互相覆盖
 
 ## 闭环示例
 

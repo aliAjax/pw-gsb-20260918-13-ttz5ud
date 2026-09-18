@@ -3,7 +3,7 @@ const { readFile, writeFile, mkdir } = require("fs/promises");
 const path = require("path");
 
 const PORT = Number(process.env.PORT || 3019);
-const DB_FILE = path.join(__dirname, "data", "db.json");
+const DB_FILE = process.env.DB_FILE || path.join(__dirname, "data", "db.json");
 
 const initialData = {
   tunes: [
@@ -60,6 +60,7 @@ const routes = [
   "GET /health",
   "GET /tunes",
   "POST /tunes",
+  "POST /tunes/:id/copy",
   "GET /tunes/:id/progress",
   "GET /tunes/:id/sections",
   "POST /tunes/:id/sections",
@@ -86,6 +87,15 @@ async function readDb() {
 
 async function writeDb(data) {
   await writeFile(DB_FILE, JSON.stringify(data, null, 2));
+}
+
+let writeQueue = Promise.resolve();
+
+// 串行执行“读取-校验-写入”整段变更，避免并发写互相覆盖或重复
+function withWriteLock(task) {
+  const result = writeQueue.then(() => task());
+  writeQueue = result.catch(() => {});
+  return result;
 }
 
 function send(res, status, body) {
@@ -177,6 +187,62 @@ async function handle(req, res) {
     db.tunes.push(tune);
     await writeDb(db);
     return send(res, 201, { data: tune });
+  }
+
+  const copyMatch = pathname.match(/^\/tunes\/([^/]+)\/copy$/);
+  if (copyMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    required(body, ["title"]);
+    const created = await withWriteLock(async () => {
+      const freshDb = await readDb();
+      const source = findTune(freshDb, copyMatch[1]);
+      if (freshDb.tunes.some((item) => item.title === body.title)) {
+        const error = new Error("标题已被占用");
+        error.status = 409;
+        throw error;
+      }
+      const sections = freshDb.sections.filter((item) => item.tuneId === source.id);
+      const uncheckedCount = sections.filter((item) => !item.checked).length;
+      if (uncheckedCount) {
+        const error = new Error(`存在 ${uncheckedCount} 个未校对区间，不能复制`);
+        error.status = 409;
+        throw error;
+      }
+      const issues = freshDb.issues.filter((item) => item.tuneId === source.id);
+      const openCount = issues.filter((item) => item.status !== "resolved").length;
+      if (openCount) {
+        const error = new Error(`存在 ${openCount} 个未解决问题，不能复制`);
+        error.status = 409;
+        throw error;
+      }
+      const newTune = {
+        id: makeId("tune"),
+        title: body.title,
+        composer: source.composer,
+        stripSpec: JSON.parse(JSON.stringify(source.stripSpec)),
+        createdAt: new Date().toISOString()
+      };
+      const sectionIds = new Map();
+      const copiedSections = sections.map((item) => {
+        const id = makeId("section");
+        sectionIds.set(item.id, id);
+        return { ...item, id, tuneId: newTune.id, checked: false };
+      });
+      const copiedIssues = issues
+        .filter((item) => item.status === "resolved" && sectionIds.has(item.sectionId))
+        .map((item) => ({
+          ...item,
+          id: makeId("issue"),
+          tuneId: newTune.id,
+          sectionId: sectionIds.get(item.sectionId)
+        }));
+      freshDb.tunes.push(newTune);
+      freshDb.sections.push(...copiedSections);
+      freshDb.issues.push(...copiedIssues);
+      await writeDb(freshDb);
+      return newTune;
+    });
+    return send(res, 201, { data: created });
   }
 
   const tuneSectionsMatch = pathname.match(/^\/tunes\/([^/]+)\/sections$/);

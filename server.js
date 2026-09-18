@@ -1,5 +1,5 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
+const { readFile, writeFile, rename, mkdir } = require("fs/promises");
 const path = require("path");
 
 const PORT = Number(process.env.PORT || 3019);
@@ -60,6 +60,7 @@ const routes = [
   "GET /health",
   "GET /tunes",
   "POST /tunes",
+  "POST /tunes/:id/copy",
   "GET /tunes/:id/progress",
   "GET /tunes/:id/sections",
   "POST /tunes/:id/sections",
@@ -85,7 +86,17 @@ async function readDb() {
 }
 
 async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
+  const tmpFile = `${DB_FILE}.tmp`;
+  await writeFile(tmpFile, JSON.stringify(data, null, 2));
+  await rename(tmpFile, DB_FILE);
+}
+
+// 串行化所有写请求：读-改-写全程持锁，避免并发请求基于旧快照互相覆盖
+let writeChain = Promise.resolve();
+function withWriteLock(task) {
+  const run = writeChain.then(task, task);
+  writeChain = run.then(() => {}, () => {});
+  return run;
 }
 
 function send(res, status, body) {
@@ -151,7 +162,7 @@ function buildProgress(db, tuneId) {
   };
 }
 
-async function handle(req, res) {
+async function handleRequest(req, res) {
   const { pathname, searchParams } = parseUrl(req);
   const db = await readDb();
 
@@ -177,6 +188,87 @@ async function handle(req, res) {
     db.tunes.push(tune);
     await writeDb(db);
     return send(res, 201, { data: tune });
+  }
+
+  const copyMatch = pathname.match(/^\/tunes\/([^/]+)\/copy$/);
+  if (copyMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    required(body, ["title"]);
+    const sourceId = copyMatch[1];
+    findTune(db, sourceId);
+    const sourceSections = db.sections.filter((item) => item.tuneId === sourceId);
+    const sourceIssues = db.issues.filter((item) => item.tuneId === sourceId);
+
+    // 先做全部校验，任一不满足直接抛错，不构造数据也不落盘
+    if (sourceSections.length === 0) {
+      const error = new Error("曲目没有任何区间，不能复制");
+      error.status = 409;
+      throw error;
+    }
+    if (sourceSections.some((item) => !item.checked)) {
+      const error = new Error("存在未校对区间，不能复制");
+      error.status = 409;
+      throw error;
+    }
+    if (sourceIssues.some((item) => item.status !== "resolved")) {
+      const error = new Error("存在未解决问题，不能复制");
+      error.status = 409;
+      throw error;
+    }
+    if (db.tunes.some((item) => item.title === body.title)) {
+      const error = new Error("标题已被占用");
+      error.status = 409;
+      throw error;
+    }
+
+    // 全部校验通过后才构造新数据并一次性落盘
+    const sourceTune = db.tunes.find((item) => item.id === sourceId);
+    const newTune = {
+      id: makeId("tune"),
+      title: body.title,
+      composer: sourceTune.composer || "",
+      stripSpec: sourceTune.stripSpec,
+      createdAt: new Date().toISOString()
+    };
+
+    // 区间重新编号并全部回到未校对
+    const sectionIdMap = new Map();
+    const newSections = sourceSections.map((section) => {
+      const newId = makeId("section");
+      sectionIdMap.set(section.id, newId);
+      return {
+        id: newId,
+        tuneId: newTune.id,
+        startBeat: section.startBeat,
+        endBeat: section.endBeat,
+        laneRange: section.laneRange,
+        checked: false,
+        note: section.note || ""
+      };
+    });
+
+    // 仅复制已解决问题，并跟随新区间重新编号；未解决问题不复制
+    const newIssues = sourceIssues
+      .filter((issue) => issue.status === "resolved")
+      .map((issue) => ({
+        ...issue,
+        id: makeId("issue"),
+        tuneId: newTune.id,
+        sectionId: sectionIdMap.get(issue.sectionId)
+      }));
+
+    db.tunes.push(newTune);
+    db.sections.push(...newSections);
+    db.issues.push(...newIssues);
+    await writeDb(db);
+
+    return send(res, 201, {
+      data: {
+        tune: newTune,
+        sections: newSections,
+        issues: newIssues
+      }
+    });
   }
 
   const tuneSectionsMatch = pathname.match(/^\/tunes\/([^/]+)\/sections$/);
@@ -275,7 +367,11 @@ async function handle(req, res) {
 }
 
 const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
+  const run =
+    req.method === "GET" || req.method === "HEAD"
+      ? handleRequest(req, res)
+      : withWriteLock(() => handleRequest(req, res));
+  run.catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
 });
 
 server.listen(PORT, () => {

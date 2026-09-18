@@ -13,6 +13,7 @@ PORT=3019 node server.js
 - `GET /health`
 - `GET /tunes`
 - `POST /tunes`
+- `POST /tunes/:id/copy`
 - `GET /tunes/:id/progress`
 - `GET /tunes/:id/sections`
 - `POST /tunes/:id/sections`
